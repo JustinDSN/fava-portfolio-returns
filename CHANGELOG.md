@@ -1,5 +1,12 @@
 # Changelog
 
+## v2.7.0 (2026-07-04)
+* feat: support multiple currencies per account [#190](https://github.com/andreasgerstmayr/fava-portfolio-returns/pull/190) ([@andreasgerstmayr](https://github.com/andreasgerstmayr))
+* Fixed investments filter [#188](https://github.com/andreasgerstmayr/fava-portfolio-returns/pull/188) ([@romamo](https://github.com/romamo))
+* fix datagrid footer alignment [#187](https://github.com/andreasgerstmayr/fava-portfolio-returns/pull/187) ([@andreasgerstmayr](https://github.com/andreasgerstmayr))
+* investments table: disable row selection [#185](https://github.com/andreasgerstmayr/fava-portfolio-returns/pull/185) ([@andreasgerstmayr](https://github.com/andreasgerstmayr))
+* feat: switch from pie chart to treemap chart for portfolio allocation [#182](https://github.com/andreasgerstmayr/fava-portfolio-returns/pull/182) ([@andreasgerstmayr](https://github.com/andreasgerstmayr))
+
 ## v2.6.0 (2026-06-07)
 * fix: filter non-investment commodities from investments tab [#176](https://github.com/andreasgerstmayr/fava-portfolio-returns/pull/176) ([@armonge](https://github.com/armonge))
 * feat: support FAVA_PREFIX [#174](https://github.com/andreasgerstmayr/fava-portfolio-returns/pull/174) ([@andreasgerstmayr](https://github.com/andreasgerstmayr))
