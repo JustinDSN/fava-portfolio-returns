@@ -17,7 +17,7 @@ from beancount.core.amount import Amount
 from beancount.core.inventory import Inventory
 from beancount.core.number import ZERO
 from beancount.core.position import Position
-from scipy.optimize import fsolve
+from scipy.optimize import brentq, fsolve
 
 from fava_portfolio_returns._vendor.beangrow.investments import AccountData, CashFlow, Cat, compute_balance_at
 
@@ -207,10 +207,50 @@ def compute_irr(
     estimated_irr = 0.2 * np.sign(np.sum(cash_flows))
 
     # Solve for the root of the NPV equation.
-    irr, *_ = fsolve(
+    irr, _infodict, ier, _mesg = fsolve(
         net_present_value, x0=estimated_irr, args=(cash_flows, years), full_output=True
     )
-    return np.maximum(irr.item(), -1)
+    root = irr.item()
+
+    # The NPV objective collapses to zero as irr -> -1, so a single-guess
+    # solver drifting into that region "converges" on a pseudo-root and gets
+    # clamped to -100%, e.g. on sign-alternating vest-then-liquidate cycles.
+    # Validate the solution and fall back to explicit bracketing over a
+    # plausible range before accepting it.
+    tolerance = 1e-6 * float(np.sum(np.abs(cash_flows))) or 1e-9
+    suspect = (
+        ier != 1
+        or root <= -0.99
+        or abs(net_present_value(root, cash_flows, years)) > tolerance
+    )
+    if suspect:
+        bracketed = bracketed_irr(cash_flows, years)
+        if bracketed is not None:
+            root = bracketed
+        elif float(np.sum(cash_flows)) > 0:
+            # Net-positive flows whose only roots sit at implausible rates
+            # (day-scale round trips annualized) have no meaningful IRR;
+            # report it as undefined rather than as a total loss.
+            return 0.0
+    return np.maximum(root, -1)
+
+
+def bracketed_irr(cash_flows: Array, years: Array) -> Optional[float]:
+    """Locate NPV sign changes over (-99%, +1000%) and return the root closest to zero.
+
+    The lower bound stays above the irr = -1 collapse zone of the objective;
+    the upper bound caps the result at rates that are still meaningful."""
+    grid = np.concatenate([np.linspace(-0.989, 2.0, 600), np.linspace(2.0, 10.0, 100)])
+    values = np.array([net_present_value(r, cash_flows, years) for r in grid])
+    roots = []
+    for lo, hi, vlo, vhi in zip(grid[:-1], grid[1:], values[:-1], values[1:]):
+        if vlo == 0.0:
+            roots.append(float(lo))
+        elif vlo * vhi < 0:
+            roots.append(float(brentq(net_present_value, lo, hi, args=(cash_flows, years))))
+    if not roots:
+        return None
+    return min(roots, key=abs)
 
 
 class Returns(typing.NamedTuple):
@@ -337,6 +377,114 @@ def truncate_cash_flows( # noqa: C901
     return cash_flows
 
 
+def transaction_key(entry: data.Transaction) -> int:
+    """Identity of a source transaction, stable across the decorated copies
+    each investment holds.
+
+    categorize_entry() rebuilds only the postings (entry._replace), so every
+    investment's copy of one source transaction shares the same meta dict —
+    its object identity is exact, unlike filename/lineno, which
+    plugin-generated transactions may miss or share. Entries without meta
+    fall back to their own identity and are simply never merged."""
+    return id(entry.meta) if entry.meta is not None else id(entry)
+
+
+def group_categorization(
+    account_data_list: List[AccountData],
+) -> Tuple[set, set, set]:
+    """Union the per-investment categorizations of a selection of investments.
+
+    Returns (member asset accounts, cash accounts, dividend accounts)."""
+    members, cash, dividends = set(), set(), set()
+    for ad in account_data_list:
+        members.add(ad.account)
+        for account, cat in ad.catmap.items():
+            if cat == Cat.CASH:
+                cash.add(account)
+            elif cat == Cat.DIVIDEND:
+                dividends.add(account)
+    return members, cash, dividends
+
+
+def produce_group_cash_flows(
+    entry: data.Transaction,
+    members: set,
+    cash_accounts: set,
+    dividend_accounts: set,
+    account: Account,
+) -> List[CashFlow]:
+    """Produce the boundary cash flows of one transaction for a whole group.
+
+    Unlike produce_cash_flows_general, which looks at a transaction from a
+    single investment's perspective, this treats the given member accounts as
+    one boundary: cash legs count once, cost-carrying legs count only when
+    they cross the boundary, and legs between members are internal transfers.
+    """
+    has_dividend = any(posting.account in dividend_accounts for posting in entry.postings)
+    flows = []
+    for posting in entry.postings:
+        if posting.account in cash_accounts:
+            cf = CashFlow(entry.date, convert.get_weight(posting), has_dividend,
+                          "cash", account, entry)
+            flows.append(cf)
+        elif posting.account in members:
+            if has_dividend:
+                cf = CashFlow(entry.date, convert.get_weight(posting), True,
+                              "dividend", account, entry)
+                flows.append(cf)
+                cf = CashFlow(entry.date, -convert.get_weight(posting), False,
+                              "reinvest", account, entry)
+                flows.append(cf)
+        elif posting.cost is not None:
+            cf = CashFlow(entry.date, convert.get_weight(posting), False,
+                          "other", account, entry)
+            flows.append(cf)
+    return flows
+
+
+def merge_cash_flows(
+    cash_flows: List[CashFlow],
+    account_data_list: List[AccountData],
+) -> List[CashFlow]:
+    """Merge per-investment cash flows into group-level cash flows.
+
+    Each investment's flows are produced from its whole transactions, so a
+    transaction touching several selected investments (a sale crossing lot
+    subaccounts, a multi-bucket retirement contribution, a rollover) was
+    processed once per investment: its cash legs are duplicated and each
+    member's asset legs leak into the other members' flows as if they crossed
+    the investment boundary. Rebuild the flows of such shared transactions
+    exactly once, group-aware. Synthetic open/close valuation flows
+    (transaction=None) pass through untouched. The result is unsorted.
+    """
+    investments_by_txn = collections.defaultdict(set)
+    for flow in cash_flows:
+        if flow.transaction is not None:
+            investments_by_txn[transaction_key(flow.transaction)].add(flow.account)
+    shared = {key for key, accounts in investments_by_txn.items() if len(accounts) > 1}
+    if not shared:
+        return cash_flows
+
+    members, cash_accounts, dividend_accounts = group_categorization(account_data_list)
+    merged = []
+    rebuilt = set()
+    for flow in cash_flows:
+        if flow.transaction is None:
+            merged.append(flow)
+            continue
+        key = transaction_key(flow.transaction)
+        if key not in shared:
+            merged.append(flow)
+        elif key not in rebuilt:
+            rebuilt.add(key)
+            merged.extend(
+                produce_group_cash_flows(
+                    flow.transaction, members, cash_accounts, dividend_accounts, flow.account
+                )
+            )
+    return merged
+
+
 def truncate_and_merge_cash_flows(
     pricer: Pricer,
     account_data_list: List[AccountData],
@@ -347,6 +495,7 @@ def truncate_and_merge_cash_flows(
     cash_flows = []
     for ad in account_data_list:
         cash_flows.extend(truncate_cash_flows(pricer, ad, date_start, date_end))
+    cash_flows = merge_cash_flows(cash_flows, account_data_list)
     cash_flows.sort(key=lambda item: item[0])
     return cash_flows
 

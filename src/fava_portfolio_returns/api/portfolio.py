@@ -11,6 +11,9 @@ from fava_portfolio_returns._vendor.beangrow.investments import AccountData
 from fava_portfolio_returns._vendor.beangrow.investments import Cat
 from fava_portfolio_returns._vendor.beangrow.investments import Currency
 from fava_portfolio_returns._vendor.beangrow.investments import produce_cash_flows_general
+from fava_portfolio_returns._vendor.beangrow.returns import group_categorization
+from fava_portfolio_returns._vendor.beangrow.returns import produce_group_cash_flows
+from fava_portfolio_returns._vendor.beangrow.returns import transaction_key
 from fava_portfolio_returns.core.portfolio import FilteredPortfolio
 from fava_portfolio_returns.core.utils import cost_value_of_inv
 from fava_portfolio_returns.core.utils import get_prices
@@ -62,6 +65,18 @@ def portfolio_values(
 ) -> list[PortfolioValue]:
     """returns (date,market,cost,cash) for all price and volume changes"""
     transactions = [txn for ad in p.account_data_list for txn in ad.transactions if txn.date <= end_date]
+
+    # A transaction touching several selected investments appears once per
+    # investment (as per-investment decorated copies). Every copy must feed
+    # the balance (each categorizes only its own commodity leaf as ASSET),
+    # but its cash flows must be produced exactly once, group-aware.
+    investments_by_txn: dict[int, set[str]] = defaultdict(set)
+    for ad in p.account_data_list:
+        for txn in ad.transactions:
+            investments_by_txn[transaction_key(txn)].add(ad.account)
+    shared_txns = {key for key, accounts in investments_by_txn.items() if len(accounts) > 1}
+    members, cash_accounts, dividend_accounts = group_categorization(p.account_data_list)
+    produced_shared: set[int] = set()
 
     # Infer the list of required prices.
     currency_pairs: set[tuple[str, str]] = set()
@@ -129,7 +144,16 @@ def portfolio_values(
             for posting in entry.postings:
                 if posting.meta and posting.meta["category"] is Cat.ASSET:
                     balance.add_position(posting)
-            for flow in produce_cash_flows_general(entry, ""):
+            key = transaction_key(entry)
+            if key in shared_txns:
+                if key in produced_shared:
+                    flows = []
+                else:
+                    produced_shared.add(key)
+                    flows = produce_group_cash_flows(entry, members, cash_accounts, dividend_accounts, "")
+            else:
+                flows = produce_cash_flows_general(entry, "")
+            for flow in flows:
                 # Convert flow amount to the target_currency at the date of the flow
                 cash_amount_converted = p.pricer.convert_amount(flow.amount, p.target_currency, date)
                 cf_balance_converted += cash_amount_converted.number or Decimal(0.0)

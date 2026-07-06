@@ -24,6 +24,7 @@ from fava_portfolio_returns._vendor.beangrow.investments import CashFlow
 from fava_portfolio_returns._vendor.beangrow.investments import Cat
 from fava_portfolio_returns._vendor.beangrow.investments import Currency
 from fava_portfolio_returns._vendor.beangrow.investments import extract
+from fava_portfolio_returns._vendor.beangrow.returns import merge_cash_flows
 from fava_portfolio_returns.core.pricer import Pricer
 from fava_portfolio_returns.core.utils import inv_to_currency
 
@@ -179,6 +180,7 @@ class FilteredPortfolio:
         cash_flows: list[CashFlow] = []
         for account_data in self.account_data_list:
             cash_flows.extend(account_data.cash_flows)
+        cash_flows = merge_cash_flows(cash_flows, self.account_data_list)
         cash_flows.sort(key=lambda flow: flow.date)
         return cash_flows
 
@@ -197,11 +199,10 @@ class FilteredPortfolio:
     def cash_at(self, date: datetime.date) -> Decimal:
         """returns the sum of all cash flows until the given date"""
         balance = Inventory()
-        for account_data in self.account_data_list:
-            for cash_flow in account_data.cash_flows:
-                if cash_flow.date > date:
-                    break
-                balance.add_amount(cash_flow.amount)
+        for cash_flow in self.cash_flows():
+            if cash_flow.date > date:
+                break
+            balance.add_amount(cash_flow.amount)
         return -inv_to_currency(self.pricer, self.target_currency, balance, date)
 
 
